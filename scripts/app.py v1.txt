@@ -1,0 +1,131 @@
+from pathlib import Path
+import sys
+
+import pandas as pd
+import streamlit as st
+
+# -----------------------------------------------------
+# Paths
+# -----------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
+
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from config import PROCESSED_DIR, VIZ_DIR  # noqa: E402
+
+WEIGHTS_PATH = PROCESSED_DIR / "zone_weights_2024.csv"
+
+# -----------------------------------------------------
+# Streamlit page settings
+# -----------------------------------------------------
+st.set_page_config(page_title="MLB Hot Zones", layout="centered")
+st.title("MLB Hot Zones (2024) — Precomputed Viewer")
+
+
+# -----------------------------------------------------
+# Helpers
+# -----------------------------------------------------
+def safe_name(s: str) -> str:
+    """Match your existing naming convention for filenames."""
+    return "".join(ch if ch.isalnum() or ch in (" ", "-", "_") else "" for ch in s).strip().replace(" ", "_")
+
+
+@st.cache_data(show_spinner=False)
+def load_players_table(weights_path: Path) -> pd.DataFrame:
+    """
+    Load ONLY the player list needed for the UI.
+    This is much faster than reading the full zone grid.
+    """
+    usecols = ["player_name", "batter"]
+
+    # Try pyarrow engine for speed; fallback cleanly if not available.
+    try:
+        df = pd.read_csv(weights_path, usecols=usecols, engine="pyarrow")
+    except Exception:
+        df = pd.read_csv(weights_path, usecols=usecols)
+
+    # Basic cleanup
+    if "player_name" not in df.columns:
+        df["player_name"] = ""
+    df["player_name"] = df["player_name"].fillna("").astype(str)
+
+    # Batter sometimes reads as float if there are NaNs; normalize to int where possible
+    df = df.dropna(subset=["batter"]).copy()
+    df["batter"] = df["batter"].astype(int)
+
+    # Unique player list
+    players = (
+        df.drop_duplicates(subset=["player_name", "batter"])
+          .sort_values("player_name")
+          .reset_index(drop=True)
+    )
+    return players
+
+
+# -----------------------------------------------------
+# Load players (cached)
+# -----------------------------------------------------
+if not WEIGHTS_PATH.exists():
+    st.error(f"Missing file: {WEIGHTS_PATH}")
+    st.stop()
+
+players = load_players_table(WEIGHTS_PATH)
+
+
+# -----------------------------------------------------
+# UI: search + selector
+# -----------------------------------------------------
+name_query = st.text_input("Type a player name (example: Aaron Judge):", "")
+
+q = name_query.strip().lower()
+if q:
+    # Fast filter; cap results to keep UI snappy even with lots of matches
+    matches = players[players["player_name"].str.lower().str.contains(q, na=False)].head(100)
+else:
+    matches = players
+
+if len(matches) == 0:
+    st.warning("No players found.")
+    st.stop()
+
+options = list(matches.itertuples(index=False, name=None))
+
+
+def format_player(opt):
+    # opt = (player_name, batter_id)
+    return f"{opt[0]} ({int(opt[1])})"
+
+
+choice = st.selectbox("Select player:", options=options, format_func=format_player)
+
+player_name = choice[0]
+batter_id = int(choice[1])
+
+
+# -----------------------------------------------------
+# Metric selector (must match what your precompute generated)
+# -----------------------------------------------------
+metric = st.selectbox(
+    "Metric:",
+    ["zone_weight", "xwoba_shrunk", "xwoba_contact", "bip_count"],
+    index=0
+)
+
+# -----------------------------------------------------
+# Expected image path (precomputed)
+# -----------------------------------------------------
+image_path = VIZ_DIR / f"hotzone_2024_{metric}_{safe_name(player_name)}_{batter_id}.png"
+
+# -----------------------------------------------------
+# Display-only behavior (no generation)
+# -----------------------------------------------------
+st.caption(f"Expected file: {image_path.name}")
+
+if image_path.exists():
+    st.image(str(image_path), caption=f"{player_name} — {metric}", use_container_width=True)
+    st.success("Loaded precomputed heatmap.")
+else:
+    st.warning("Heatmap image not found (precompute may not have been run, or filename mismatch).")
+    st.info("To generate ALL heatmaps, run:  python scripts/06_precompute_heatmaps_2024.py")

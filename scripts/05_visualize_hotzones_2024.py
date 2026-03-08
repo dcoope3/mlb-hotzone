@@ -98,22 +98,51 @@ def zones_to_matrix(values_by_zone: pd.Series) -> np.ndarray:
     return np.flipud(arr)
 
 
+def add_grid_outer_border(ax: plt.Axes) -> None:
+    """
+    Draw only the 5x5 grid border.
+    This prevents the extra whitespace below from looking like a 6th row.
+    """
+    ax.add_patch(
+        Rectangle(
+            (-0.5, -0.5),
+            5.0,
+            5.0,
+            fill=False,
+            edgecolor="black",
+            linewidth=1.2,
+            zorder=6,
+        )
+    )
+
+
 def add_strike_zone_box(ax: plt.Axes) -> None:
     ax.add_patch(
-        Rectangle((0.5, 0.5), 3.0, 3.0, fill=False, edgecolor="black", linewidth=3.0, zorder=6)
+        Rectangle((0.5, 0.5), 3.0, 3.0, fill=False, edgecolor="black", linewidth=3.0, zorder=7)
     )
 
 
 def add_home_plate(ax: plt.Axes) -> None:
+    """
+    Standalone home plate fully below the 5x5 grid.
+    The point faces downward toward the bottom of the screen.
+    """
     cx = 2.0
-    y = -0.85
+
+    # Grid bottom is y = 4.5. Put plate clearly below that.
+    top_y = 5.18
+    half_top_width = 1.05
+    shoulder_drop = 0.72
+    point_y = 6.48
+    shoulder_inset = 0.28
+
     plate = Polygon(
         [
-            (cx - 0.35, y + 0.20),
-            (cx + 0.35, y + 0.20),
-            (cx + 0.35, y - 0.05),
-            (cx, y - 0.35),
-            (cx - 0.35, y - 0.05),
+            (cx - half_top_width, top_y),                      # top-left
+            (cx + half_top_width, top_y),                      # top-right
+            (cx + half_top_width + shoulder_inset, top_y + shoulder_drop),  # right shoulder
+            (cx, point_y),                                     # bottom point
+            (cx - half_top_width - shoulder_inset, top_y + shoulder_drop),  # left shoulder
         ],
         closed=True,
         facecolor="white",
@@ -423,12 +452,35 @@ def add_handedness_text(ax: plt.Axes, hand: str | None) -> str:
 
 
 def add_colorbar_opposite_side(fig: plt.Figure, ax: plt.Axes, im, batter_side: str):
-    cbar_side = "right" if batter_side == "left" else "left"
-    divider = make_axes_locatable(ax)
-    cax = divider.append_axes(cbar_side, size="4.5%", pad=0.30)
+    """
+    Colorbar aligned exactly with the 5x5 grid height.
+    """
+
+    # Position of the heatmap axis
+    pos = ax.get_position()
+
+    # Heatmap occupies only the upper portion of the axis
+    grid_bottom_fraction = 0.33
+    grid_height_fraction = 0.67
+
+    grid_bottom = pos.y0 + pos.height * grid_bottom_fraction
+    grid_height = pos.height * grid_height_fraction
+
+    if batter_side == "left":
+        cbar_x = pos.x1 + 0.015
+    else:
+        cbar_x = pos.x0 - 0.035
+
+    cax = fig.add_axes([
+        cbar_x,
+        grid_bottom,
+        0.02,
+        grid_height
+    ])
+
     cbar = fig.colorbar(im, cax=cax)
 
-    if cbar_side == "left":
+    if batter_side == "right":
         cax.yaxis.set_ticks_position("left")
         cax.yaxis.set_label_position("left")
     else:
@@ -473,7 +525,6 @@ def add_player_banner(
     age_text = f"Age: {age}" if age is not None else "Age: Unknown"
     bats_throws_text = f"Bats/Throws: {batting_hand_text(bat_side)}/{throws if throws else 'Unknown'}"
 
-    # banner background
     ax_banner = fig.add_axes([0.04, 0.79, 0.92, 0.15])
     ax_banner.set_facecolor("#e7e7e7")
     ax_banner.set_xticks([])
@@ -481,7 +532,6 @@ def add_player_banner(
     for spine in ax_banner.spines.values():
         spine.set_visible(False)
 
-    # headshot area
     ax_img = fig.add_axes([0.055, 0.802, 0.12, 0.125])
     ax_img.set_xticks([])
     ax_img.set_yticks([])
@@ -505,7 +555,6 @@ def add_player_banner(
             transform=ax_img.transAxes,
         )
 
-    # text block
     fig.text(0.20, 0.875, name_text, ha="left", va="center", fontsize=20, fontweight="bold")
     fig.text(0.20, 0.835, stat_text, ha="left", va="center", fontsize=13, fontweight="bold")
     fig.text(0.73, 0.878, age_text, ha="right", va="center", fontsize=11.5)
@@ -552,17 +601,33 @@ def plot_heatmap(
     ax.set_xticks([])
     ax.set_yticks([])
 
-    ax.set_xticks(np.arange(-0.5, NX, 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, NZ, 1), minor=True)
-    ax.grid(which="minor", color="lightgray", linestyle="-", linewidth=1.0, zorder=4)
-    ax.tick_params(which="minor", bottom=False, left=False)
+    # Only gridlines inside the 5x5 heatmap (do not extend below the grid)
+    ax.set_xticks([])
+    ax.set_yticks([])
 
+    grid_color = "lightgray"
+    grid_lw = 1.0
+
+    # vertical interior lines
+    for x in [0.5, 1.5, 2.5, 3.5]:
+        ax.plot([x, x], [-0.5, 4.5], color=grid_color, linewidth=grid_lw, zorder=4)
+
+    # horizontal interior lines
+    for y in [0.5, 1.5, 2.5, 3.5]:
+        ax.plot([-0.5, 4.5], [y, y], color=grid_color, linewidth=grid_lw, zorder=4)
+
+    # Hide axes spines so no fake 5x6 enclosing border appears
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    add_grid_outer_border(ax)
     add_strike_zone_box(ax)
     add_home_plate(ax)
     batter_side = add_handedness_text(ax, batter_hand)
 
-    ax.set_ylim(NZ - 0.5, -1.3)
+    # Extra whitespace below the 5x5 grid for standalone home plate
     ax.set_xlim(-0.5, NX - 0.5)
+    ax.set_ylim(6.95, -0.5)
 
     add_colorbar_opposite_side(fig, ax, im, batter_side)
     add_league_average_note(ax, metric, league_note)

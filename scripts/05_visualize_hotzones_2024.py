@@ -54,26 +54,16 @@ def load_weights(path: Path) -> pd.DataFrame:
         "batter",
         "zone_id",
         "player_name",
-
-        # league baselines
         "league_xwoba_contact",
         "league_babip",
         "league_contact_rate",
-
-        # xwOBA contact surface
         "bip_count",
         "xwoba_contact",
         "xwoba_shrunk",
         "zone_weight",
-
-        # volume
         "pitches_seen",
-
-        # BABIP
         "bip",
         "babip",
-
-        # Contact%
         "swings",
         "contact_rate",
     }
@@ -157,40 +147,28 @@ def fill_missing_zones_for_player(
 
     keep = [
         "zone_id",
-
-        # volume
         "pitches_seen",
-
-        # BABIP
         "bip",
         "babip",
-
-        # xwOBA contact surface
         "bip_count",
         "xwoba_contact",
         "xwoba_shrunk",
         "zone_weight",
-
-        # Contact%
         "swings",
         "contact_rate",
     ]
     filled = base.merge(p[keep], on="zone_id", how="left")
 
-    # volume
     filled["pitches_seen"] = filled["pitches_seen"].fillna(0).astype(int)
 
-    # xwOBA contact surface
     filled["bip_count"] = filled["bip_count"].fillna(0).astype(int)
     filled["xwoba_contact"] = filled["xwoba_contact"].fillna(filled["league_xwoba_contact"])
     filled["xwoba_shrunk"] = filled["xwoba_shrunk"].fillna(filled["league_xwoba_contact"])
     filled["zone_weight"] = filled["zone_weight"].fillna(0.0)
 
-    # BABIP
     filled["bip"] = filled["bip"].fillna(0).astype(int)
     filled["babip"] = filled["babip"].fillna(filled["league_babip"])
 
-    # Contact%
     filled["swings"] = filled["swings"].fillna(0).astype(int)
     filled["contact_rate"] = filled["contact_rate"].fillna(filled["league_contact_rate"])
 
@@ -237,7 +215,8 @@ def choose_cmap_norm_label(
         return (
             "bwr",
             TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit),
-            "Zone Weight (Player − League), Centered at 0",
+            0.0,
+            None,
         )
 
     if metric in ("xwoba_shrunk", "xwoba_contact"):
@@ -248,11 +227,11 @@ def choose_cmap_norm_label(
             spread = 0.01
         vmin = league_avg_xwoba - spread
         vmax = league_avg_xwoba + spread
-        metric_label = "xwOBA Shrunk" if metric == "xwoba_shrunk" else "xwOBA Contact"
         return (
             "bwr",
             TwoSlopeNorm(vmin=vmin, vcenter=league_avg_xwoba, vmax=vmax),
-            f"{metric_label} (Centered at League Avg {league_avg_xwoba:.3f})",
+            league_avg_xwoba,
+            f"League Avg: {league_avg_xwoba:.3f}",
         )
 
     if metric == "babip":
@@ -266,7 +245,8 @@ def choose_cmap_norm_label(
         return (
             "bwr",
             TwoSlopeNorm(vmin=vmin, vcenter=league_avg_babip, vmax=vmax),
-            f"BABIP (Centered at League Avg {league_avg_babip:.3f})",
+            league_avg_babip,
+            f"League Avg: {league_avg_babip:.3f}",
         )
 
     if metric == "contact_rate":
@@ -280,26 +260,20 @@ def choose_cmap_norm_label(
         return (
             "bwr",
             TwoSlopeNorm(vmin=vmin, vcenter=league_avg_contact, vmax=vmax),
-            f"Contact Rate (Centered at League Avg {league_avg_contact:.3f})",
+            league_avg_contact,
+            f"League Avg: {league_avg_contact:.3f}",
         )
 
     if metric in ("bip_count", "pitches_seen"):
         vmax = float(np.nanmax(value_mat))
         if not np.isfinite(vmax) or vmax <= 0:
             vmax = 1.0
-        label = "BIP Count" if metric == "bip_count" else "Pitches Seen"
-        return "Blues", plt.Normalize(vmin=0.0, vmax=vmax), label
+        return "Blues", plt.Normalize(vmin=0.0, vmax=vmax), None, None
 
-    return "viridis", None, display_metric_name(metric)
+    return "viridis", None, None, None
 
 
 def get_count_matrix_for_metric(player_df: pd.DataFrame, metric: str) -> np.ndarray:
-    """
-    What sample size should `--annotate-counts` show?
-    - xwOBA metrics: bip_count
-    - BABIP: bip
-    - contact_rate: swings
-    """
     if metric in ("xwoba_shrunk", "xwoba_contact", "zone_weight"):
         return zones_to_matrix(player_df.set_index("zone_id")["bip_count"])
     if metric == "babip":
@@ -310,11 +284,6 @@ def get_count_matrix_for_metric(player_df: pd.DataFrame, metric: str) -> np.ndar
 
 
 def load_batter_handedness(batter_id: int) -> str | None:
-    """
-    Visualization-only helper.
-    Uses the zoned Statcast file if available.
-    Does not change any calculations or metric definitions.
-    """
     zoned_path = PROCESSED_DIR / "statcast_zones_2024.csv"
     if not zoned_path.exists():
         return None
@@ -348,21 +317,10 @@ def load_batter_handedness(batter_id: int) -> str | None:
     hand = mode_vals.iloc[0]
     if hand in {"L", "R"}:
         return hand
-
     return None
 
 
 def handedness_text_and_side(hand: str | None) -> tuple[str, str]:
-    """
-    Returns:
-    - label text
-    - visual side of chart
-
-    Viewer-facing chart convention:
-    - Right-handed batter label on left side
-    - Left-handed batter label on right side
-    - Unknown handedness goes in the right-handed batter box position (left side)
-    """
     if hand == "L":
         return "Left-Handed Batter", "right"
     if hand == "R":
@@ -392,13 +350,12 @@ def add_handedness_text(ax: plt.Axes, hand: str | None) -> str:
     return side
 
 
-def add_colorbar_opposite_side(fig: plt.Figure, ax: plt.Axes, im, batter_side: str, label: str):
+def add_colorbar_opposite_side(fig: plt.Figure, ax: plt.Axes, im, batter_side: str):
     cbar_side = "right" if batter_side == "left" else "left"
 
     divider = make_axes_locatable(ax)
     cax = divider.append_axes(cbar_side, size="4.5%", pad=0.30)
     cbar = fig.colorbar(im, cax=cax)
-    cbar.set_label(label)
 
     if cbar_side == "left":
         cax.yaxis.set_ticks_position("left")
@@ -407,7 +364,28 @@ def add_colorbar_opposite_side(fig: plt.Figure, ax: plt.Axes, im, batter_side: s
         cax.yaxis.set_ticks_position("right")
         cax.yaxis.set_label_position("right")
 
+    # remove all colorbar label text
+    cbar.set_label("")
     return cbar
+
+
+def add_league_average_note(ax: plt.Axes, metric: str, league_note: str | None) -> None:
+    if metric == "zone_weight":
+        return
+    if league_note is None:
+        return
+
+    ax.text(
+        4.42,
+        4.42,
+        league_note,
+        ha="right",
+        va="bottom",
+        fontsize=8.5,
+        fontweight="bold",
+        color="black",
+        zorder=9,
+    )
 
 
 def plot_heatmap(
@@ -429,7 +407,7 @@ def plot_heatmap(
     league_avg_babip = float(player_df["league_babip"].drop_duplicates().mean())
     league_avg_contact = float(player_df["league_contact_rate"].drop_duplicates().mean())
 
-    cmap, norm, label = choose_cmap_norm_label(
+    cmap, norm, _, league_note = choose_cmap_norm_label(
         metric,
         value_mat,
         league_avg_xwoba,
@@ -440,18 +418,16 @@ def plot_heatmap(
 
     batter_hand = load_batter_handedness(batter_id)
 
-    fig, ax = plt.subplots(figsize=(7.4, 6.8))
+    fig, ax = plt.subplots(figsize=(7.6, 6.9))
     im = ax.imshow(value_mat, cmap=cmap, norm=norm, aspect="equal", interpolation="nearest", zorder=1)
 
     ax.set_title(f"{title_name} — {season} {metric_display}", fontsize=14, pad=12)
 
-    # Remove axis labels and numbered bin labels
     ax.set_xlabel("")
     ax.set_ylabel("")
     ax.set_xticks([])
     ax.set_yticks([])
 
-    # Keep gridlines only
     ax.set_xticks(np.arange(-0.5, NX, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, NZ, 1), minor=True)
     ax.grid(which="minor", color="lightgray", linestyle="-", linewidth=1.0, zorder=4)
@@ -459,13 +435,13 @@ def plot_heatmap(
 
     add_strike_zone_box(ax)
     add_home_plate(ax)
-
     batter_side = add_handedness_text(ax, batter_hand)
 
     ax.set_ylim(NZ - 0.5, -1.3)
     ax.set_xlim(-0.5, NX - 0.5)
 
-    add_colorbar_opposite_side(fig, ax, im, batter_side, label)
+    add_colorbar_opposite_side(fig, ax, im, batter_side)
+    add_league_average_note(ax, metric, league_note)
 
     count_mat = get_count_matrix_for_metric(player_df, metric)
 

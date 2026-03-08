@@ -1,9 +1,10 @@
 data/raw/
 data/processed/
+
+# optional if you also generate lots of images
 visualizations/
-*.csv
-*.png
+
+# python
+.venv/
 __pycache__/
-*.pyc
-.vscode/
-.DS_Store
+*.pyc 

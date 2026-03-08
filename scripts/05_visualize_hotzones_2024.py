@@ -1,32 +1,20 @@
 """
-Script 5 — Visualize 2024 Hot Zones with MLB-style visuals
+Script 5 — Visualize 2024 Hot Zones (5x5 grid)
 
-INPUT : data/processed/zone_weights_2024.csv  (built by Script 4)
+INPUT : data/processed/zone_weights_2024.csv
 OUTPUT: PNG files saved to /visualizations (VIZ_DIR)
 
-What it does:
-- Loads per-player/per-zone metrics (zone_weight, xwoba_shrunk, xwoba_contact, bip_count)
-- Builds a GLOBAL league baseline map by zone_id (0..24)
-- For any selected player, ensures a full 25-zone grid:
-    - Missing zones filled neutrally using league baseline:
-        bip_count = 0
-        xwoba_shrunk = league_xwoba_contact
-        zone_weight = 0
-- Renders a 5×5 heatmap with:
-    - Thin light-gray zone gridlines
-    - Thick black strike-zone box (middle 3×3)
-    - Home plate marker for orientation
+Supported metrics:
+- zone_weight
+- xwoba_shrunk
+- xwoba_contact
+- bip_count
+- pitches_seen
+- babip
+- contact_rate
 
-Color rules:
-- zone_weight: diverging blue-white-red centered at 0
-- xwoba_shrunk / xwoba_contact: diverging blue-white-red centered at LEAGUE AVG xwOBA
-  (blue below league avg, red above league avg)
-- bip_count: sequential Blues
-
-Run examples (from project root):
-  python scripts/05_visualize_hotzones_2024.py --player "Aaron Judge" --metric zone_weight --annotate-values --annotate-counts
-  python scripts/05_visualize_hotzones_2024.py --player "Aaron Judge" --metric xwoba_shrunk --annotate-values --annotate-counts
-  python scripts/05_visualize_hotzones_2024.py --batter 592450 --metric zone_weight
+CLI (matches app.py):
+  python scripts/05_visualize_hotzones_2024.py --batter 592450 --metric contact_rate --season 2024 --annotate-values --annotate-counts --overwrite
 """
 
 from __future__ import annotations
@@ -39,40 +27,65 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.patches import Rectangle, Polygon
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-# NOTE:
-# Your config.py lives in /scripts (based on how it defines PROJECT_ROOT) :contentReference[oaicite:2]{index=2}
 from config import PROCESSED_DIR, VIZ_DIR
+from utils_paths import heatmap_path
 
 NX = 5
 NZ = 5
 ALL_ZONES = list(range(NX * NZ))  # 0..24
 
+VALID_METRICS = {
+    "zone_weight",
+    "xwoba_shrunk",
+    "xwoba_contact",
+    "bip_count",
+    "pitches_seen",
+    "babip",
+    "contact_rate",
+}
 
-# -----------------------------
-# Loading + validation
-# -----------------------------
+
 def load_weights(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
 
     required = {
         "batter",
         "zone_id",
-        "bip_count",
+        "player_name",
+
+        # league baselines
         "league_xwoba_contact",
+        "league_babip",
+        "league_contact_rate",
+
+        # xwOBA contact surface
+        "bip_count",
+        "xwoba_contact",
         "xwoba_shrunk",
         "zone_weight",
+
+        # volume
+        "pitches_seen",
+
+        # BABIP
+        "bip",
+        "babip",
+
+        # Contact%
+        "swings",
+        "contact_rate",
     }
     missing = sorted(list(required - set(df.columns)))
     if missing:
-        raise ValueError(f"Missing required columns in {path}: {missing}")
+        raise ValueError(
+            f"zone_weights_2024.csv missing columns: {missing}\n"
+            "Rebuild with Script 4 (the Contact% + BABIP version)."
+        )
 
-    if "player_name" not in df.columns:
-        df["player_name"] = pd.NA
-
-    # xwoba_contact is optional (script 4 outputs it, but we don’t require it)
-    if "xwoba_contact" not in df.columns:
-        df["xwoba_contact"] = np.nan
+    df["batter"] = df["batter"].astype(int)
+    df["zone_id"] = df["zone_id"].astype(int)
 
     if not df["zone_id"].between(0, 24).all():
         bad = df.loc[~df["zone_id"].between(0, 24), "zone_id"].unique()
@@ -81,80 +94,7 @@ def load_weights(path: Path) -> pd.DataFrame:
     return df
 
 
-def build_league_map(df: pd.DataFrame) -> pd.Series:
-    """
-    Global baseline: zone_id -> league_xwoba_contact.
-    IMPORTANT: must be computed from full df (not player subset).
-    """
-    league_map = df.groupby("zone_id")["league_xwoba_contact"].mean().reindex(ALL_ZONES)
-    if league_map.isna().any():
-        missing = league_map[league_map.isna()].index.tolist()
-        raise ValueError(
-            f"League baseline missing for zone_id(s): {missing}. "
-            "This indicates Script 4 output does not include league baselines for all zones."
-        )
-    return league_map
-
-
-def compute_league_avg_xwoba(df: pd.DataFrame) -> float:
-    """
-    Compute a single league-average xwOBA baseline for centering absolute xwOBA colormaps.
-    If league_bip exists, use it for a weighted average. Otherwise use simple mean across zones.
-    """
-    cols = ["zone_id", "league_xwoba_contact"]
-    d = df[cols].drop_duplicates("zone_id").copy()
-
-    # Weighted average if league_bip exists (not guaranteed)
-    if "league_bip" in df.columns:
-        w = df[["zone_id", "league_bip"]].drop_duplicates("zone_id").set_index("zone_id")["league_bip"]
-        d = d.set_index("zone_id")
-        d["league_bip"] = w.reindex(d.index).fillna(0)
-        if d["league_bip"].sum() > 0:
-            return float((d["league_xwoba_contact"] * d["league_bip"]).sum() / d["league_bip"].sum())
-
-    # Fallback: simple mean across zones
-    return float(d["league_xwoba_contact"].mean())
-
-
-# -----------------------------
-# Fill missing zones
-# -----------------------------
-def fill_missing_zones_for_player(p: pd.DataFrame, league_map: pd.Series) -> pd.DataFrame:
-    """
-    Ensure the player has all 25 zones.
-    Missing zones filled neutrally:
-      bip_count = 0
-      xwoba_shrunk = league_xwoba_contact
-      zone_weight = 0
-      xwoba_contact = NaN
-    """
-    batter_id = int(p["batter"].iloc[0])
-    player_name = p["player_name"].iloc[0] if "player_name" in p.columns else pd.NA
-
-    base = pd.DataFrame({"zone_id": ALL_ZONES})
-    base["batter"] = batter_id
-    base["player_name"] = player_name
-    base["league_xwoba_contact"] = league_map.values
-
-    keep = ["zone_id", "bip_count", "xwoba_shrunk", "zone_weight", "xwoba_contact"]
-    filled = base.merge(p[keep], on="zone_id", how="left")
-
-    filled["bip_count"] = filled["bip_count"].fillna(0).astype(int)
-    filled["xwoba_shrunk"] = filled["xwoba_shrunk"].fillna(filled["league_xwoba_contact"])
-    filled["zone_weight"] = filled["zone_weight"].fillna(0.0)
-    # xwoba_contact can stay NaN
-
-    return filled.sort_values("zone_id").reset_index(drop=True)
-
-
-# -----------------------------
-# Plot helpers
-# -----------------------------
 def zones_to_matrix(values_by_zone: pd.Series) -> np.ndarray:
-    """
-    zone_id -> (z, x) using zone_id = z*5 + x.
-    Flip vertically so z=4 appears at the top.
-    """
     arr = np.full((NZ, NX), np.nan, dtype=float)
     for zone_id, val in values_by_zone.items():
         z = int(zone_id) // NX
@@ -165,15 +105,7 @@ def zones_to_matrix(values_by_zone: pd.Series) -> np.ndarray:
 
 def add_strike_zone_box(ax: plt.Axes) -> None:
     ax.add_patch(
-        Rectangle(
-            (0.5, 0.5),
-            3.0,
-            3.0,
-            fill=False,
-            edgecolor="black",
-            linewidth=3.0,
-            zorder=6,
-        )
+        Rectangle((0.5, 0.5), 3.0, 3.0, fill=False, edgecolor="black", linewidth=3.0, zorder=6)
     )
 
 
@@ -185,7 +117,7 @@ def add_home_plate(ax: plt.Axes) -> None:
             (cx - 0.35, y + 0.20),
             (cx + 0.35, y + 0.20),
             (cx + 0.35, y - 0.05),
-            (cx,        y - 0.35),
+            (cx, y - 0.35),
             (cx - 0.35, y - 0.05),
         ],
         closed=True,
@@ -198,24 +130,101 @@ def add_home_plate(ax: plt.Axes) -> None:
     ax.add_patch(plate)
 
 
-def safe_player_stub(player_name: str | float, batter_id: int) -> str:
-    if player_name is None or pd.isna(player_name) or str(player_name).strip() == "":
-        return f"batter_{batter_id}"
-    safe = "".join(ch if ch.isalnum() or ch in (" ", "-", "_") else "" for ch in str(player_name)).strip()
-    safe = safe.replace(" ", "_")
-    return f"{safe}_{batter_id}"
+def league_zone_map(df: pd.DataFrame, col: str) -> pd.Series:
+    s = df.groupby("zone_id")[col].mean().reindex(ALL_ZONES)
+    if s.isna().any():
+        missing = s[s.isna()].index.tolist()
+        raise ValueError(f"League map missing '{col}' for zones: {missing}")
+    return s
 
 
-def choose_cmap_and_norm(
+def fill_missing_zones_for_player(
+    p: pd.DataFrame,
+    league_xwoba_map: pd.Series,
+    league_babip_map: pd.Series,
+    league_contact_map: pd.Series,
+) -> pd.DataFrame:
+    batter_id = int(p["batter"].iloc[0])
+    player_name = str(p["player_name"].iloc[0] or "")
+
+    base = pd.DataFrame({"zone_id": ALL_ZONES})
+    base["batter"] = batter_id
+    base["player_name"] = player_name
+
+    base["league_xwoba_contact"] = league_xwoba_map.values
+    base["league_babip"] = league_babip_map.values
+    base["league_contact_rate"] = league_contact_map.values
+
+    keep = [
+        "zone_id",
+
+        # volume
+        "pitches_seen",
+
+        # BABIP
+        "bip",
+        "babip",
+
+        # xwOBA contact surface
+        "bip_count",
+        "xwoba_contact",
+        "xwoba_shrunk",
+        "zone_weight",
+
+        # Contact%
+        "swings",
+        "contact_rate",
+    ]
+    filled = base.merge(p[keep], on="zone_id", how="left")
+
+    # volume
+    filled["pitches_seen"] = filled["pitches_seen"].fillna(0).astype(int)
+
+    # xwOBA contact surface
+    filled["bip_count"] = filled["bip_count"].fillna(0).astype(int)
+    filled["xwoba_contact"] = filled["xwoba_contact"].fillna(filled["league_xwoba_contact"])
+    filled["xwoba_shrunk"] = filled["xwoba_shrunk"].fillna(filled["league_xwoba_contact"])
+    filled["zone_weight"] = filled["zone_weight"].fillna(0.0)
+
+    # BABIP
+    filled["bip"] = filled["bip"].fillna(0).astype(int)
+    filled["babip"] = filled["babip"].fillna(filled["league_babip"])
+
+    # Contact%
+    filled["swings"] = filled["swings"].fillna(0).astype(int)
+    filled["contact_rate"] = filled["contact_rate"].fillna(filled["league_contact_rate"])
+
+    return filled.sort_values("zone_id").reset_index(drop=True)
+
+
+def display_metric_name(metric: str) -> str:
+    mapping = {
+        "zone_weight": "Zone Weight",
+        "xwoba_shrunk": "xwOBA Shrunk",
+        "xwoba_contact": "xwOBA Contact",
+        "bip_count": "BIP Count",
+        "pitches_seen": "Pitches Seen",
+        "babip": "BABIP",
+        "contact_rate": "Contact Rate",
+    }
+    return mapping.get(metric, metric)
+
+
+def display_player_name(player_name: str, batter_id: int) -> str:
+    clean = str(player_name or "").strip()
+    if not clean:
+        return f"Batter {batter_id}"
+    return clean.title()
+
+
+def choose_cmap_norm_label(
     metric: str,
     value_mat: np.ndarray,
-    fixed_limit: float | None,
     league_avg_xwoba: float,
+    league_avg_babip: float,
+    league_avg_contact: float,
+    fixed_limit: float | None,
 ):
-    """
-    Returns (cmap, norm, label)
-    """
-    # Diverging centered at 0 for relative weights
     if metric == "zone_weight":
         if fixed_limit is not None and fixed_limit > 0:
             limit = float(fixed_limit)
@@ -225,226 +234,334 @@ def choose_cmap_and_norm(
             limit = max(abs(vmin), abs(vmax))
             if not np.isfinite(limit) or limit == 0:
                 limit = 0.01
+        return (
+            "bwr",
+            TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit),
+            "Zone Weight (Player − League), Centered at 0",
+        )
 
-        cmap = "bwr"
-        norm = TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit)
-        label = "zone_weight (player − league zone baseline), centered at 0"
-        return cmap, norm, label
-
-    # Absolute xwOBA metrics but colored relative to league average
     if metric in ("xwoba_shrunk", "xwoba_contact"):
         vmin = float(np.nanmin(value_mat))
         vmax = float(np.nanmax(value_mat))
-
-        # Spread around league avg so it is centered
         spread = max(abs(vmax - league_avg_xwoba), abs(league_avg_xwoba - vmin))
         if not np.isfinite(spread) or spread == 0:
             spread = 0.01
-
         vmin = league_avg_xwoba - spread
         vmax = league_avg_xwoba + spread
+        metric_label = "xwOBA Shrunk" if metric == "xwoba_shrunk" else "xwOBA Contact"
+        return (
+            "bwr",
+            TwoSlopeNorm(vmin=vmin, vcenter=league_avg_xwoba, vmax=vmax),
+            f"{metric_label} (Centered at League Avg {league_avg_xwoba:.3f})",
+        )
 
-        cmap = "bwr"
-        norm = TwoSlopeNorm(vmin=vmin, vcenter=league_avg_xwoba, vmax=vmax)
-        label = f"{metric} (absolute), centered at league avg {league_avg_xwoba:.3f}"
-        return cmap, norm, label
+    if metric == "babip":
+        vmin = float(np.nanmin(value_mat))
+        vmax = float(np.nanmax(value_mat))
+        spread = max(abs(vmax - league_avg_babip), abs(league_avg_babip - vmin))
+        if not np.isfinite(spread) or spread == 0:
+            spread = 0.02
+        vmin = league_avg_babip - spread
+        vmax = league_avg_babip + spread
+        return (
+            "bwr",
+            TwoSlopeNorm(vmin=vmin, vcenter=league_avg_babip, vmax=vmax),
+            f"BABIP (Centered at League Avg {league_avg_babip:.3f})",
+        )
 
-    # Counts
-    if metric == "bip_count":
-        cmap = "Blues"
-        vmin = 0
+    if metric == "contact_rate":
+        vmin = float(np.nanmin(value_mat))
+        vmax = float(np.nanmax(value_mat))
+        spread = max(abs(vmax - league_avg_contact), abs(league_avg_contact - vmin))
+        if not np.isfinite(spread) or spread == 0:
+            spread = 0.02
+        vmin = league_avg_contact - spread
+        vmax = league_avg_contact + spread
+        return (
+            "bwr",
+            TwoSlopeNorm(vmin=vmin, vcenter=league_avg_contact, vmax=vmax),
+            f"Contact Rate (Centered at League Avg {league_avg_contact:.3f})",
+        )
+
+    if metric in ("bip_count", "pitches_seen"):
         vmax = float(np.nanmax(value_mat))
         if not np.isfinite(vmax) or vmax <= 0:
             vmax = 1.0
-        norm = plt.Normalize(vmin=vmin, vmax=vmax)
-        label = "bip_count"
-        return cmap, norm, label
+        label = "BIP Count" if metric == "bip_count" else "Pitches Seen"
+        return "Blues", plt.Normalize(vmin=0.0, vmax=vmax), label
 
-    # Fallback
-    cmap = "viridis"
-    norm = None
-    label = metric
-    return cmap, norm, label
+    return "viridis", None, display_metric_name(metric)
 
 
-def plot_player_heatmap(
-    player_df: pd.DataFrame,
-    metric: str,
-    annotate_values: bool,
-    annotate_counts: bool,
-    out_dir: Path,
-    fixed_limit: float | None,
-    league_avg_xwoba: float,
-) -> Path:
-    player_name = player_df["player_name"].iloc[0]
-    batter_id = int(player_df["batter"].iloc[0])
+def get_count_matrix_for_metric(player_df: pd.DataFrame, metric: str) -> np.ndarray:
+    """
+    What sample size should `--annotate-counts` show?
+    - xwOBA metrics: bip_count
+    - BABIP: bip
+    - contact_rate: swings
+    """
+    if metric in ("xwoba_shrunk", "xwoba_contact", "zone_weight"):
+        return zones_to_matrix(player_df.set_index("zone_id")["bip_count"])
+    if metric == "babip":
+        return zones_to_matrix(player_df.set_index("zone_id")["bip"])
+    if metric == "contact_rate":
+        return zones_to_matrix(player_df.set_index("zone_id")["swings"])
+    return np.full((NZ, NX), np.nan, dtype=float)
 
-    title_name = str(player_name).strip() if pd.notna(player_name) and str(player_name).strip() else f"batter {batter_id}"
-    file_stub = safe_player_stub(player_name, batter_id)
 
-    if metric not in player_df.columns:
-        raise ValueError(f"Metric '{metric}' not in data. Available: {list(player_df.columns)}")
+def load_batter_handedness(batter_id: int) -> str | None:
+    """
+    Visualization-only helper.
+    Uses the zoned Statcast file if available.
+    Does not change any calculations or metric definitions.
+    """
+    zoned_path = PROCESSED_DIR / "statcast_zones_2024.csv"
+    if not zoned_path.exists():
+        return None
 
-    value_mat = zones_to_matrix(player_df.set_index("zone_id")[metric])
-    count_mat = zones_to_matrix(player_df.set_index("zone_id")["bip_count"])
+    try:
+        z = pd.read_csv(zoned_path, usecols=["batter", "stand"])
+    except Exception:
+        return None
 
-    cmap, norm, cbar_label = choose_cmap_and_norm(metric, value_mat, fixed_limit, league_avg_xwoba)
+    if "batter" not in z.columns or "stand" not in z.columns:
+        return None
 
-    fig, ax = plt.subplots(figsize=(6.6, 6.8))
-    im = ax.imshow(
-        value_mat,
-        cmap=cmap,
-        norm=norm,
-        aspect="equal",
-        interpolation="nearest",
-        zorder=1,
+    z = z.dropna(subset=["batter"]).copy()
+    z["batter"] = z["batter"].astype(int)
+
+    batter_rows = (
+        z.loc[z["batter"] == int(batter_id), "stand"]
+        .dropna()
+        .astype(str)
+        .str.upper()
+        .str.strip()
     )
 
-    ax.set_title(f"{title_name} — 2024 {metric}")
-    ax.set_xlabel("x_bin (0→4)")
-    ax.set_ylabel("z_bin (4→0 shown top→bottom)")
+    if batter_rows.empty:
+        return None
 
-    ax.set_xticks(range(NX))
-    ax.set_yticks(range(NZ))
-    ax.set_xticklabels([str(i) for i in range(NX)])
-    ax.set_yticklabels([str(i) for i in range(NZ)][::-1])
+    mode_vals = batter_rows.mode()
+    if mode_vals.empty:
+        return None
 
-    # Thin zone gridlines
+    hand = mode_vals.iloc[0]
+    if hand in {"L", "R"}:
+        return hand
+
+    return None
+
+
+def handedness_text_and_side(hand: str | None) -> tuple[str, str]:
+    """
+    Returns:
+    - label text
+    - visual side of chart
+
+    Viewer-facing chart convention:
+    - Right-handed batter label on left side
+    - Left-handed batter label on right side
+    - Unknown handedness goes in the right-handed batter box position (left side)
+    """
+    if hand == "L":
+        return "Left-Handed Batter", "right"
+    if hand == "R":
+        return "Right-Handed Batter", "left"
+    return "Unknown Handedness", "left"
+
+
+def add_handedness_text(ax: plt.Axes, hand: str | None) -> str:
+    label, side = handedness_text_and_side(hand)
+
+    x_pos = -0.95 if side == "left" else 4.95
+    ha = "right" if side == "left" else "left"
+
+    ax.text(
+        x_pos,
+        2.0,
+        label,
+        rotation=90,
+        ha=ha,
+        va="center",
+        fontsize=11,
+        fontweight="bold",
+        color="black",
+        clip_on=False,
+        zorder=8,
+    )
+    return side
+
+
+def add_colorbar_opposite_side(fig: plt.Figure, ax: plt.Axes, im, batter_side: str, label: str):
+    cbar_side = "right" if batter_side == "left" else "left"
+
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes(cbar_side, size="4.5%", pad=0.30)
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label(label)
+
+    if cbar_side == "left":
+        cax.yaxis.set_ticks_position("left")
+        cax.yaxis.set_label_position("left")
+    else:
+        cax.yaxis.set_ticks_position("right")
+        cax.yaxis.set_label_position("right")
+
+    return cbar
+
+
+def plot_heatmap(
+    player_df: pd.DataFrame,
+    metric: str,
+    season: int,
+    annotate_values: bool,
+    annotate_counts: bool,
+    fixed_limit: float | None,
+) -> Path:
+    raw_player_name = str(player_df["player_name"].iloc[0] or "")
+    batter_id = int(player_df["batter"].iloc[0])
+    title_name = display_player_name(raw_player_name, batter_id)
+    metric_display = display_metric_name(metric)
+
+    value_mat = zones_to_matrix(player_df.set_index("zone_id")[metric])
+
+    league_avg_xwoba = float(player_df["league_xwoba_contact"].drop_duplicates().mean())
+    league_avg_babip = float(player_df["league_babip"].drop_duplicates().mean())
+    league_avg_contact = float(player_df["league_contact_rate"].drop_duplicates().mean())
+
+    cmap, norm, label = choose_cmap_norm_label(
+        metric,
+        value_mat,
+        league_avg_xwoba,
+        league_avg_babip,
+        league_avg_contact,
+        fixed_limit,
+    )
+
+    batter_hand = load_batter_handedness(batter_id)
+
+    fig, ax = plt.subplots(figsize=(7.4, 6.8))
+    im = ax.imshow(value_mat, cmap=cmap, norm=norm, aspect="equal", interpolation="nearest", zorder=1)
+
+    ax.set_title(f"{title_name} — {season} {metric_display}", fontsize=14, pad=12)
+
+    # Remove axis labels and numbered bin labels
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    # Keep gridlines only
     ax.set_xticks(np.arange(-0.5, NX, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, NZ, 1), minor=True)
     ax.grid(which="minor", color="lightgray", linestyle="-", linewidth=1.0, zorder=4)
     ax.tick_params(which="minor", bottom=False, left=False)
 
-    # Strike zone + plate
     add_strike_zone_box(ax)
     add_home_plate(ax)
+
+    batter_side = add_handedness_text(ax, batter_hand)
+
     ax.set_ylim(NZ - 0.5, -1.3)
+    ax.set_xlim(-0.5, NX - 0.5)
 
-    # Colorbar
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(cbar_label)
+    add_colorbar_opposite_side(fig, ax, im, batter_side, label)
 
-    # Annotations
+    count_mat = get_count_matrix_for_metric(player_df, metric)
+
     if annotate_values or annotate_counts:
         for r in range(NZ):
             for c in range(NX):
                 v = value_mat[r, c]
-                n = int(round(count_mat[r, c])) if not np.isnan(count_mat[r, c]) else 0
+                n = count_mat[r, c]
+                n_int = int(round(n)) if (annotate_counts and not np.isnan(n)) else None
 
                 lines = []
+
                 if annotate_values:
                     if np.isnan(v):
                         lines.append("NA")
                     else:
-                        if metric == "bip_count":
+                        if metric in ("bip_count", "pitches_seen"):
                             lines.append(f"{int(round(v))}")
                         else:
                             lines.append(f"{v:.3f}")
 
-                if annotate_counts and metric != "bip_count":
-                    lines.append(f"n={n}")
+                if annotate_counts:
+                    if metric not in ("bip_count", "pitches_seen") and n_int is not None:
+                        lines.append(f"n={n_int}")
 
                 if lines:
-                    ax.text(c, r, "\n".join(lines), ha="center", va="center", fontsize=8, color="black", zorder=5)
+                    ax.text(
+                        c,
+                        r,
+                        "\n".join(lines),
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                        color="black",
+                        zorder=5,
+                    )
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"hotzone_2024_{metric}_{file_stub}.png"
+    VIZ_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = heatmap_path(VIZ_DIR, season, metric, raw_player_name, batter_id)
+
     fig.tight_layout()
-    fig.savefig(out_path, dpi=220)
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
 
-# -----------------------------
-# Player selection
-# -----------------------------
-def select_player(df: pd.DataFrame, player: str | None, batter: int | None) -> pd.DataFrame:
-    if batter is not None:
-        sub = df[df["batter"] == batter].copy()
-        if sub.empty:
-            raise ValueError(f"No rows found for batter id {batter}")
-        return sub
-
-    if player is None or player.strip() == "":
-        raise ValueError('Provide --player "First Last" or --batter <id>.')
-
-    q = player.strip().lower()
-
-    # exact match
-    sub = df[df["player_name"].fillna("").str.lower() == q].copy()
-    if not sub.empty:
-        return sub
-
-    # contains match
-    sub = df[df["player_name"].fillna("").str.lower().str.contains(q, na=False)].copy()
-    if sub.empty:
-        raise ValueError(f"No rows found matching '{player}'. Try different spelling or use --batter.")
-    return sub
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--player", type=str, default=None, help='Player name (e.g., "Aaron Judge")')
-    parser.add_argument("--batter", type=int, default=None, help="MLBAM batter id (e.g., 592450)")
-    parser.add_argument("--metric", type=str, default="zone_weight",
-                        help="zone_weight | xwoba_shrunk | xwoba_contact | bip_count")
-    parser.add_argument("--annotate-values", action="store_true", help="Write metric value in each cell")
-    parser.add_argument("--annotate-counts", action="store_true", help="Write n=BIP count in each cell")
-    parser.add_argument("--top", type=int, default=None, help="Batch mode: plot top N hitters by mean zone_weight")
-    parser.add_argument("--fixed-limit", type=float, default=0.15,
-                        help="For zone_weight only: symmetric limit. Use 0 for auto per player.")
+    parser.add_argument("--player", type=str, default=None)
+    parser.add_argument("--batter", type=int, default=None)
+    parser.add_argument("--metric", type=str, default="zone_weight", choices=sorted(VALID_METRICS))
+    parser.add_argument("--annotate-values", action="store_true")
+    parser.add_argument("--annotate-counts", action="store_true")
+    parser.add_argument("--season", type=int, default=2024)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--fixed-limit", type=float, default=0.15)
     args = parser.parse_args()
 
-    in_path = PROCESSED_DIR / "zone_weights_2024.csv"
-    df = load_weights(in_path)
+    df = load_weights(PROCESSED_DIR / "zone_weights_2024.csv")
 
-    league_map = build_league_map(df)
-    league_avg_xwoba = compute_league_avg_xwoba(df)
+    if args.batter is not None:
+        p = df[df["batter"] == int(args.batter)].copy()
+        if p.empty:
+            raise ValueError(f"No rows found for batter id {args.batter}")
+    else:
+        if not args.player or not args.player.strip():
+            raise ValueError('Provide --player "First Last" or --batter <id>.')
+        q = args.player.strip().lower()
+        p = df[df["player_name"].fillna("").str.lower() == q].copy()
+        if p.empty:
+            p = df[df["player_name"].fillna("").str.lower().str.contains(q, na=False)].copy()
+        if p.empty:
+            raise ValueError(f"No rows found matching '{args.player}'")
 
-    fixed_limit = None if (args.fixed_limit is not None and args.fixed_limit <= 0) else args.fixed_limit
+    league_xwoba_map = league_zone_map(df, "league_xwoba_contact")
+    league_babip_map = league_zone_map(df, "league_babip")
+    league_contact_map = league_zone_map(df, "league_contact_rate")
 
-    # Batch mode
-    if args.top is not None:
-        if args.top <= 0:
-            raise ValueError("--top must be positive")
+    p = fill_missing_zones_for_player(p, league_xwoba_map, league_babip_map, league_contact_map)
 
-        rank = (
-            df.groupby(["batter", "player_name"], as_index=False)["zone_weight"]
-            .mean()
-            .sort_values("zone_weight", ascending=False)
-            .head(args.top)
-        )
+    batter_id = int(p["batter"].iloc[0])
+    player_name = str(p["player_name"].iloc[0] or "")
+    out_path = heatmap_path(VIZ_DIR, int(args.season), args.metric, player_name, batter_id)
 
-        print(f"Plotting top {args.top} hitters by mean zone_weight...")
-        for _, row in rank.iterrows():
-            batter_id = int(row["batter"])
-            p = df[df["batter"] == batter_id].copy()
-            p = fill_missing_zones_for_player(p, league_map)
-
-            out = plot_player_heatmap(
-                p,
-                metric=args.metric,
-                annotate_values=args.annotate_values,
-                annotate_counts=args.annotate_counts,
-                out_dir=VIZ_DIR,
-                fixed_limit=fixed_limit if args.metric == "zone_weight" else None,
-                league_avg_xwoba=league_avg_xwoba,
-            )
-            print("Saved:", out)
+    if out_path.exists() and not args.overwrite:
+        print(f"Exists (skip, use --overwrite to replace): {out_path}")
         return
 
-    # Single player mode
-    p = select_player(df, args.player, args.batter)
-    p = fill_missing_zones_for_player(p, league_map)
-
-    out = plot_player_heatmap(
-        p,
+    fixed_limit = None if args.fixed_limit <= 0 else args.fixed_limit
+    out = plot_heatmap(
+        player_df=p,
         metric=args.metric,
-        annotate_values=args.annotate_values,
-        annotate_counts=args.annotate_counts,
-        out_dir=VIZ_DIR,
+        season=int(args.season),
+        annotate_values=bool(args.annotate_values),
+        annotate_counts=bool(args.annotate_counts),
         fixed_limit=fixed_limit if args.metric == "zone_weight" else None,
-        league_avg_xwoba=league_avg_xwoba,
     )
     print("Saved:", out)
 

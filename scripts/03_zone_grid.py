@@ -185,10 +185,6 @@ def main() -> None:
     xb = np.empty(len(df), dtype=int)
     zb = np.empty(len(df), dtype=int)
 
-    # Use itertuples for speed
-    # We'll still construct a Series-like access via row._asdict() minimally; faster approach:
-    # keep row as Series by iterating over df.iterrows() (slower) OR do a hybrid:
-    # Here: iterate over positions and access df.iloc[i] (OK for moderate sizes)
     for j in range(len(df)):
         row = df.iloc[j]
         x_bin, z_bin = assign_zone_row(row, j)

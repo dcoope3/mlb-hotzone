@@ -1,3 +1,10 @@
+# app.py — auto-update heatmap on selection change
+#
+# Run:
+#   streamlit run app.py
+
+from __future__ import annotations
+
 import sys
 import subprocess
 from pathlib import Path
@@ -6,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 # -----------------------------------------------------
-# Allow importing config.py from scripts folder
+# Project paths
 # -----------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
@@ -14,206 +21,205 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from config import PROCESSED_DIR, VIZ_DIR
+from config import PROCESSED_DIR, VIZ_DIR  # noqa: E402
+from utils_paths import heatmap_path  # noqa: E402
 
-
-# -----------------------------------------------------
-# File locations
-# -----------------------------------------------------
 WEIGHTS_PATH = PROCESSED_DIR / "zone_weights_2024.csv"
 SCRIPT5_PATH = SCRIPTS_DIR / "05_visualize_hotzones_2024.py"
-
+SEASON = 2024
 
 # -----------------------------------------------------
-# Streamlit page settings
+# Available metrics (MUST match Script 5 choices)
 # -----------------------------------------------------
-st.set_page_config(
-    page_title="MLB Hot Zones",
-    layout="centered"
-)
+METRICS = [
+    "zone_weight",
+    "xwoba_shrunk",
+    "xwoba_contact",
+    "bip_count",
+    "pitches_seen",
+    "babip",
+    "contact_rate",
+]
 
+# -----------------------------------------------------
+# Streamlit settings
+# -----------------------------------------------------
+st.set_page_config(page_title="MLB Hot Zones", layout="centered")
 st.title("MLB Hot Zones (2024)")
 
+st.caption(
+    "Counts overlay uses the right denominator per metric: "
+    "xwOBA → BIP contact count, BABIP → BIP count, Contact Rate → swings."
+)
 
 # -----------------------------------------------------
-# Load data
+# Helpers
 # -----------------------------------------------------
-@st.cache_data
-def load_weights():
-    df = pd.read_csv(WEIGHTS_PATH)
+@st.cache_data(show_spinner=False)
+def load_players(weights_path: Path) -> pd.DataFrame:
+    usecols = ["player_name", "batter"]
+    try:
+        df = pd.read_csv(weights_path, usecols=usecols, engine="pyarrow")
+    except Exception:
+        df = pd.read_csv(weights_path, usecols=usecols)
+
+    df = df.dropna(subset=["batter"]).copy()
+    df["batter"] = df["batter"].astype(int)
 
     if "player_name" not in df.columns:
         df["player_name"] = ""
 
-    return df
+    df["player_name"] = df["player_name"].fillna("").astype(str)
 
-
-df = load_weights()
-
-
-# -----------------------------------------------------
-# Player list
-# -----------------------------------------------------
-players = (
-    df[["player_name", "batter"]]
-    .dropna()
-    .drop_duplicates()
-    .sort_values("player_name")
-)
-
-
-# -----------------------------------------------------
-# Search box
-# -----------------------------------------------------
-name_query = st.text_input(
-    "Type a player name (example: Aaron Judge):",
-    ""
-)
-
-if name_query.strip():
-    matches = players[
-        players["player_name"].str.lower().str.contains(
-            name_query.lower(),
-            na=False
-        )
-    ]
-else:
-    matches = players
-
-
-if len(matches) == 0:
-    st.warning("No players found.")
-    st.stop()
-
-
-# -----------------------------------------------------
-# Player selector
-# -----------------------------------------------------
-options = list(matches.itertuples(index=False, name=None))
-
-
-def format_player(opt):
-    return f"{opt[0]} ({int(opt[1])})"
-
-
-choice = st.selectbox(
-    "Select player:",
-    options=options,
-    format_func=format_player
-)
-
-
-player_name = choice[0]
-batter_id = int(choice[1])
-
-
-# -----------------------------------------------------
-# Metric selector
-# -----------------------------------------------------
-metric = st.selectbox(
-    "Metric:",
-    [
-        "zone_weight",
-        "xwoba_shrunk",
-        "xwoba_contact",
-        "bip_count"
-    ]
-)
-
-
-# -----------------------------------------------------
-# Annotation options
-# -----------------------------------------------------
-col1, col2 = st.columns(2)
-
-with col1:
-    annotate_values = st.checkbox(
-        "Annotate values",
-        value=True
-    )
-
-with col2:
-    annotate_counts = st.checkbox(
-        "Annotate BIP counts",
-        value=True
+    return (
+        df.drop_duplicates(subset=["player_name", "batter"])
+        .sort_values("player_name")
+        .reset_index(drop=True)
     )
 
 
-# -----------------------------------------------------
-# Expected image path
-# -----------------------------------------------------
-def safe_name(s):
-    return "".join(
-        ch if ch.isalnum() or ch in (" ", "-", "_")
-        else ""
-        for ch in s
-    ).strip().replace(" ", "_")
+def run_script5(
+    batter_id: int,
+    metric: str,
+    annotate_values: bool,
+    annotate_counts: bool,
+) -> tuple[int, str, str]:
+    """
+    Runs Script 5 to generate a single heatmap.
+    Always overwrites so current visualization settings are reflected.
+    Returns (returncode, stdout, stderr).
+    """
+    if metric not in METRICS:
+        return 1, "", f"Invalid metric requested by app.py: {metric}"
 
-
-image_path = (
-    VIZ_DIR /
-    f"hotzone_2024_{metric}_{safe_name(player_name)}_{batter_id}.png"
-)
-
-
-# -----------------------------------------------------
-# Run Script 5
-# -----------------------------------------------------
-def generate_heatmap():
     cmd = [
         sys.executable,
         str(SCRIPT5_PATH),
         "--batter",
-        str(batter_id),
+        str(int(batter_id)),
         "--metric",
-        metric
+        metric,
+        "--season",
+        str(SEASON),
+        "--overwrite",
     ]
 
     if annotate_values:
         cmd.append("--annotate-values")
-
     if annotate_counts:
         cmd.append("--annotate-counts")
 
-    result = subprocess.run(
+    p = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        cwd=str(PROJECT_ROOT)
+        cwd=str(PROJECT_ROOT),
     )
-
-    return result.returncode, result.stdout, result.stderr
+    return p.returncode, p.stdout, p.stderr
 
 
 # -----------------------------------------------------
-# Generate button
+# Guardrails
 # -----------------------------------------------------
-if st.button("Generate / Update Heatmap"):
+if not WEIGHTS_PATH.exists():
+    st.error(f"Missing weights file: {WEIGHTS_PATH}")
+    st.info("Run Script 4 first.")
+    st.stop()
 
+if not SCRIPT5_PATH.exists():
+    st.error(f"Missing Script 5: {SCRIPT5_PATH}")
+    st.stop()
+
+VIZ_DIR.mkdir(parents=True, exist_ok=True)
+
+players = load_players(WEIGHTS_PATH)
+
+# -----------------------------------------------------
+# Session state
+# -----------------------------------------------------
+if "last_request_key" not in st.session_state:
+    st.session_state.last_request_key = None
+
+if "last_gen_result" not in st.session_state:
+    st.session_state.last_gen_result = None
+
+# -----------------------------------------------------
+# UI
+# -----------------------------------------------------
+name_query = st.text_input("Search player:", "")
+q = name_query.strip().lower()
+
+if q:
+    matches = players[players["player_name"].str.lower().str.contains(q, na=False)].head(100)
+else:
+    matches = players
+
+if matches.empty:
+    st.warning("No players found.")
+    st.stop()
+
+options = list(matches.itertuples(index=False, name=None))
+
+
+def format_player(opt) -> str:
+    return f"{opt[0]} ({int(opt[1])})"
+
+
+choice = st.selectbox("Player:", options=options, format_func=format_player)
+
+player_name = str(choice[0] or "")
+batter_id = int(choice[1])
+
+metric = st.selectbox("Metric:", METRICS, index=0)
+
+col1, col2 = st.columns(2)
+with col1:
+    annotate_values = st.checkbox("Annotate values", value=True)
+with col2:
+    annotate_counts = st.checkbox("Annotate sample size (n)", value=True)
+
+# -----------------------------------------------------
+# Image path
+# -----------------------------------------------------
+image_path = heatmap_path(
+    viz_dir=VIZ_DIR,
+    season=SEASON,
+    metric=metric,
+    player_name=player_name,
+    batter_id=batter_id,
+)
+
+st.caption(f"Expected file: {image_path.name}")
+
+# -----------------------------------------------------
+# Automatic regeneration
+# -----------------------------------------------------
+request_key = (batter_id, metric, annotate_values, annotate_counts)
+
+selection_changed = request_key != st.session_state.last_request_key
+need_generate = selection_changed or (not image_path.exists())
+
+if need_generate:
+    st.session_state.last_request_key = request_key
     with st.spinner("Generating heatmap..."):
+        code, out, err = run_script5(
+            batter_id=batter_id,
+            metric=metric,
+            annotate_values=annotate_values,
+            annotate_counts=annotate_counts,
+        )
+    st.session_state.last_gen_result = (code, out, err)
 
-        code, out, err = generate_heatmap()
-
-    if code == 0:
-        st.success("Heatmap generated.")
-    else:
-        st.error("Script 5 failed.")
+# -----------------------------------------------------
+# Display
+# -----------------------------------------------------
+if st.session_state.last_gen_result is not None:
+    code, out, err = st.session_state.last_gen_result
+    if code != 0:
+        st.error("Heatmap generation failed.")
         st.code(err if err else out)
 
-
-# -----------------------------------------------------
-# Display image
-# -----------------------------------------------------
 if image_path.exists():
-
-    st.image(
-        str(image_path),
-        caption=f"{player_name} — {metric}",
-        use_container_width=True
-    )
-
+    st.image(str(image_path), caption=f"{player_name} — {metric}", width="stretch")
 else:
-
-    st.info(
-        "No heatmap yet for this player. Click 'Generate / Update Heatmap'."
-    )
+    st.warning("Heatmap file not found. Generation may have failed.")

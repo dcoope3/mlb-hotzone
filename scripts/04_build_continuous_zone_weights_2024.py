@@ -1,30 +1,40 @@
 """
-Build 2024 player-by-zone value surfaces (xwOBA on contact) with shrinkage,
-AND attach player names (MLBAM id -> name) to the output.
+Script 4 — Build 2024 player-by-zone metrics (value + volume + BABIP + Contact%) with shrinkage.
 
 INPUT  : data/processed/statcast_zones_2024.csv
 OUTPUT : data/processed/zone_weights_2024.csv
 
-Key choices:
-- Eligibility filter: keep only hitters with >= 500 pitches seen in 2024
-  (pitches seen = number of rows in statcast_zones_2024.csv for that batter)
-- Contact/BIP proxy: rows where `estimated_woba_using_speedangle` is NOT null
-- Shrinkage: toward league zone baseline with stabilization constant K (default 50)
-- zone_weight = xwoba_shrunk - league_xwoba_contact
+Adds:
+- pitches_seen (all pitches in zone)
 
-Notes:
-- Output includes one row per (batter, zone_id) that had at least 1 BIP/contact in that zone.
-  This means some hitters will have < 25 rows (missing zones with 0 BIP).
-  If you later want a full 25-zone grid per hitter for cleaner heatmaps, tell me and I’ll
-  modify this to “complete” zones 0..24 per hitter and fill missing with league baseline.
+CONTACT%:
+- swings   (# swings in zone)
+- contacts (# contact outcomes on swings: foul or ball in play)
+- whiffs   (# whiffs on swings)
+- contact_rate = contacts / swings  (NaN if swings == 0)
+- league baselines by zone: league_swings, league_contacts, league_whiffs, league_contact_rate
+
+BABIP:
+- bip (balls in play count, including hits-in-play + outs-in-play + ROE + SF)
+- bip_hits (hits on balls in play: 1B/2B/3B; HR excluded)
+- babip = bip_hits / bip  (NaN if bip == 0)
+- league baselines by zone: league_bip, league_bip_hits, league_babip
+
+xwOBA contact surface:
+- bip_count (contact proxy via estimated_woba_using_speedangle not null)
+- xwoba_contact
+- league_xwoba_contact
+- xwoba_shrunk
+- zone_weight = xwoba_shrunk - league_xwoba_contact
 """
 
 from __future__ import annotations
 
 import pandas as pd
+import numpy as np
+
 from config import PROCESSED_DIR
 
-# pybaseball is in your requirements.txt, so this should be available
 from pybaseball import cache
 from pybaseball import playerid_reverse_lookup
 
@@ -38,13 +48,46 @@ OUTPUT_WEIGHTS_2024 = "zone_weights_2024.csv"
 # Parameters
 # -----------------------------
 MIN_PITCHES_SEEN = 500
+K = 50  # shrinkage constant for xwOBA contact
 
-# Stabilization constant for shrinkage (tune later; 30–60 is common for contact metrics)
-K = 50
+# -----------------------------
+# BABIP definitions
+# -----------------------------
+BIP_HIT_EVENTS = {"single", "double", "triple"}
+
+BIP_EVENTS = {
+    "single", "double", "triple",
+    "field_out", "force_out",
+    "grounded_into_double_play", "double_play", "triple_play",
+    "fielders_choice", "fielders_choice_out",
+    "reached_on_error",
+    "sac_fly", "sac_fly_double_play",
+    "sac_bunt", "sac_bunt_double_play",
+}
+
+# -----------------------------
+# Contact% definitions (Statcast "description")
+# -----------------------------
+# We interpret "contact" as: foul OR ball put in play (regardless of result).
+CONTACT_DESCRIPTIONS = {
+    "foul",
+    "foul_tip",
+    "foul_bunt",              # optional; keep or remove if you want "swings" to exclude bunts
+    "hit_into_play",
+    "hit_into_play_no_out",
+    "hit_into_play_score",
+}
+
+WHIFF_DESCRIPTIONS = {
+    "swinging_strike",
+    "swinging_strike_blocked",
+    "missed_bunt",            # optional; keep or remove depending on how you treat bunts
+}
+
+SWING_DESCRIPTIONS = CONTACT_DESCRIPTIONS | WHIFF_DESCRIPTIONS
 
 
 def main() -> None:
-    # Enable caching so name lookups don’t keep re-downloading in future runs
     cache.enable()
 
     in_path = PROCESSED_DIR / INPUT_ZONED_2024
@@ -54,132 +97,247 @@ def main() -> None:
     df = pd.read_csv(in_path)
     print("Rows loaded:", len(df))
 
-    # Required columns
-    needed = ["batter", "zone_id", "estimated_woba_using_speedangle"]
+    needed = ["batter", "zone_id", "estimated_woba_using_speedangle", "events", "description"]
     missing = [c for c in needed if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing columns: {missing}. Found columns: {list(df.columns)}")
+        raise ValueError(
+            f"Missing columns: {missing}. "
+            "Did you rerun Script 02 and Script 03 after adding 'description'?"
+        )
 
     # -----------------------------
-    # 0) Eligibility filter: >= 500 pitches seen in 2024
+    # 0) Eligibility: >= MIN_PITCHES_SEEN pitches (rows) in zoned file
     # -----------------------------
-    pitches_seen = (
+    pitches_seen_total = (
         df.groupby("batter", as_index=False)
         .size()
-        .rename(columns={"size": "pitches_seen"})
+        .rename(columns={"size": "pitches_seen_total"})
     )
-
-    eligible_hitters = pitches_seen.loc[
-        pitches_seen["pitches_seen"] >= MIN_PITCHES_SEEN, "batter"
-    ]
+    eligible = pitches_seen_total.loc[pitches_seen_total["pitches_seen_total"] >= MIN_PITCHES_SEEN, "batter"]
 
     print("Hitters total in zoned file:", df["batter"].nunique())
-    print(f"Eligible hitters (>= {MIN_PITCHES_SEEN} pitches):", eligible_hitters.nunique())
+    print(f"Eligible hitters (>= {MIN_PITCHES_SEEN} pitches):", eligible.nunique())
 
-    df = df[df["batter"].isin(eligible_hitters)].copy()
+    df = df[df["batter"].isin(eligible)].copy()
     print("Rows after eligibility filter:", len(df))
 
-    # -----------------------------
-    # 1) Contact/BIP proxy
-    # -----------------------------
-    bip = df.dropna(subset=["estimated_woba_using_speedangle"]).copy()
-    print("Contact/BIP rows (eligible hitters):", len(bip))
+    if not df["zone_id"].between(0, 24).all():
+        bad = df.loc[~df["zone_id"].between(0, 24), "zone_id"].unique()
+        raise ValueError(f"zone_id out of 0..24 found: {bad}")
 
-    if len(bip) == 0:
+    # -----------------------------
+    # 1) Volume metrics on ALL pitches
+    # -----------------------------
+    player_zone_pitches = (
+        df.groupby(["batter", "zone_id"], as_index=False)
+        .agg(pitches_seen=("zone_id", "size"))
+    )
+
+    league_zone_pitches = (
+        df.groupby("zone_id", as_index=False)
+        .agg(league_pitches_seen=("zone_id", "size"))
+    )
+
+    # -----------------------------
+    # 2) Contact% on swings
+    # -----------------------------
+    desc = df["description"].fillna("").astype(str)
+
+    df["is_swing"] = desc.isin(SWING_DESCRIPTIONS)
+    df["is_contact"] = desc.isin(CONTACT_DESCRIPTIONS)
+    df["is_whiff"] = desc.isin(WHIFF_DESCRIPTIONS)
+
+    player_zone_contact_pct = (
+        df.groupby(["batter", "zone_id"], as_index=False)
+        .agg(
+            swings=("is_swing", "sum"),
+            contacts=("is_contact", "sum"),
+            whiffs=("is_whiff", "sum"),
+        )
+    )
+    player_zone_contact_pct["contact_rate"] = np.where(
+        player_zone_contact_pct["swings"] > 0,
+        player_zone_contact_pct["contacts"] / player_zone_contact_pct["swings"],
+        np.nan,
+    )
+
+    league_zone_contact_pct = (
+        df.groupby("zone_id", as_index=False)
+        .agg(
+            league_swings=("is_swing", "sum"),
+            league_contacts=("is_contact", "sum"),
+            league_whiffs=("is_whiff", "sum"),
+        )
+    )
+    league_zone_contact_pct["league_contact_rate"] = np.where(
+        league_zone_contact_pct["league_swings"] > 0,
+        league_zone_contact_pct["league_contacts"] / league_zone_contact_pct["league_swings"],
+        np.nan,
+    )
+
+    # -----------------------------
+    # 3) BABIP by zone
+    # -----------------------------
+    df["is_bip"] = df["events"].isin(BIP_EVENTS)
+    df["is_bip_hit"] = df["events"].isin(BIP_HIT_EVENTS)
+
+    player_zone_babip = (
+        df.groupby(["batter", "zone_id"], as_index=False)
+        .agg(
+            bip=("is_bip", "sum"),
+            bip_hits=("is_bip_hit", "sum"),
+        )
+    )
+    player_zone_babip["babip"] = np.where(
+        player_zone_babip["bip"] > 0,
+        player_zone_babip["bip_hits"] / player_zone_babip["bip"],
+        np.nan,
+    )
+
+    league_zone_babip = (
+        df.groupby("zone_id", as_index=False)
+        .agg(
+            league_bip=("is_bip", "sum"),
+            league_bip_hits=("is_bip_hit", "sum"),
+        )
+    )
+    league_zone_babip["league_babip"] = np.where(
+        league_zone_babip["league_bip"] > 0,
+        league_zone_babip["league_bip_hits"] / league_zone_babip["league_bip"],
+        np.nan,
+    )
+
+    # -----------------------------
+    # 4) xwOBA on contact (your existing approach)
+    # -----------------------------
+    bip_contact = df.dropna(subset=["estimated_woba_using_speedangle"]).copy()
+    print("Contact/BIP rows (eligible hitters):", len(bip_contact))
+    if len(bip_contact) == 0:
         raise ValueError("No contact/BIP rows found after filtering. Check your input data.")
 
-    # -----------------------------
-    # 2) Player-zone raw (2024)
-    # -----------------------------
-    player_zone = (
-        bip.groupby(["batter", "zone_id"], as_index=False)
+    player_zone_xwoba = (
+        bip_contact.groupby(["batter", "zone_id"], as_index=False)
         .agg(
             bip_count=("estimated_woba_using_speedangle", "size"),
             xwoba_contact=("estimated_woba_using_speedangle", "mean"),
         )
     )
 
-    # -----------------------------
-    # 3) League-zone baseline (2024)
-    # -----------------------------
-    league_zone = (
-        bip.groupby("zone_id", as_index=False)
+    league_zone_xwoba = (
+        bip_contact.groupby("zone_id", as_index=False)
         .agg(
-            league_bip=("estimated_woba_using_speedangle", "size"),
+            league_bip_contact=("estimated_woba_using_speedangle", "size"),
             league_xwoba_contact=("estimated_woba_using_speedangle", "mean"),
         )
     )
 
-    m = player_zone.merge(league_zone, on="zone_id", how="left")
+    # -----------------------------
+    # 5) Merge into one player-zone table
+    # -----------------------------
+    m = player_zone_pitches.merge(player_zone_contact_pct, on=["batter", "zone_id"], how="left")
+    m = m.merge(player_zone_babip, on=["batter", "zone_id"], how="left")
+    m = m.merge(player_zone_xwoba, on=["batter", "zone_id"], how="left")
+
+    m = m.merge(league_zone_xwoba, on="zone_id", how="left")
+    m = m.merge(league_zone_pitches, on="zone_id", how="left")
+    m = m.merge(league_zone_babip, on="zone_id", how="left")
+    m = m.merge(league_zone_contact_pct, on="zone_id", how="left")
 
     # -----------------------------
-    # 4) Shrinkage toward league zone baseline
+    # 6) Fill missing / neutral defaults
+    # -----------------------------
+    # Swings/contact/whiff
+    m["swings"] = m["swings"].fillna(0).astype(int)
+    m["contacts"] = m["contacts"].fillna(0).astype(int)
+    m["whiffs"] = m["whiffs"].fillna(0).astype(int)
+
+    # For zones with 0 swings, set contact_rate to league_contact_rate (neutral)
+    m["contact_rate"] = m["contact_rate"].fillna(m["league_contact_rate"])
+
+    # xwOBA contact fields for zones with 0 contact
+    m["bip_count"] = m["bip_count"].fillna(0).astype(int)
+    m["xwoba_contact"] = m["xwoba_contact"].fillna(m["league_xwoba_contact"])
+
+    # BABIP components for zones with 0 BIP
+    m["bip"] = m["bip"].fillna(0).astype(int)
+    m["bip_hits"] = m["bip_hits"].fillna(0).astype(int)
+    m["babip"] = m["babip"].fillna(m["league_babip"])
+
+    # -----------------------------
+    # 7) Shrinkage toward league zone baseline (xwOBA contact)
     # -----------------------------
     m["xwoba_shrunk"] = (
         (m["bip_count"] * m["xwoba_contact"] + K * m["league_xwoba_contact"])
         / (m["bip_count"] + K)
     )
-
-    # -----------------------------
-    # 5) Continuous zone weight (relative to league at that zone)
-    # -----------------------------
     m["zone_weight"] = m["xwoba_shrunk"] - m["league_xwoba_contact"]
 
-    out = m[
-        [
-            "batter",
-            "zone_id",
-            "bip_count",
-            "xwoba_contact",
-            "league_xwoba_contact",
-            "xwoba_shrunk",
-            "zone_weight",
-        ]
-    ].sort_values(["batter", "zone_id"])
-
     # -----------------------------
-    # 6) Add player names (MLBAM -> first/last)
+    # 8) Add player names
     # -----------------------------
     print("Adding player names via pybaseball lookup...")
-    ids = out["batter"].dropna().unique()
-
-    # Reverse lookup expects a list/array of MLBAM ids
+    ids = m["batter"].dropna().unique()
     players = playerid_reverse_lookup(ids, key_type="mlbam")
+    players["player_name"] = (players["name_first"].fillna("") + " " + players["name_last"].fillna("")).str.strip()
 
-    # Build a single display name
-    players["player_name"] = players["name_first"].fillna("") + " " + players["name_last"].fillna("")
-    players["player_name"] = players["player_name"].str.strip()
-
-    # Merge into output
-    out = out.merge(
+    m = m.merge(
         players[["key_mlbam", "player_name"]],
         left_on="batter",
         right_on="key_mlbam",
         how="left",
     ).drop(columns=["key_mlbam"])
 
-    # Put player_name first for readability
-    cols = ["player_name"] + [c for c in out.columns if c != "player_name"]
-    out = out[cols]
+    # -----------------------------
+    # 9) Output
+    # -----------------------------
+    cols = [
+        "player_name",
+        "batter",
+        "zone_id",
 
-    # -----------------------------
-    # 7) Sanity checks + summary
-    # -----------------------------
-    if not out["zone_id"].between(0, 24).all():
-        bad = out.loc[~out["zone_id"].between(0, 24), "zone_id"].unique()
-        raise ValueError(f"zone_id out of 0..24 found: {bad}")
+        # Volume
+        "pitches_seen",
+        "league_pitches_seen",
+
+        # Contact%
+        "swings",
+        "contacts",
+        "whiffs",
+        "contact_rate",
+        "league_swings",
+        "league_contacts",
+        "league_whiffs",
+        "league_contact_rate",
+
+        # BABIP
+        "bip",
+        "bip_hits",
+        "babip",
+        "league_bip",
+        "league_bip_hits",
+        "league_babip",
+
+        # xwOBA contact surface
+        "bip_count",
+        "xwoba_contact",
+        "league_xwoba_contact",
+        "xwoba_shrunk",
+        "zone_weight",
+    ]
+
+    out = m[cols].sort_values(["batter", "zone_id"]).reset_index(drop=True)
 
     zones_per_hitter = out.groupby("batter")["zone_id"].nunique()
 
     print("---- OUTPUT SUMMARY ----")
-    print("Eligible hitters (>= pitches seen):", eligible_hitters.nunique())
-    print("Hitters in weight table:", out["batter"].nunique())
-    print("Rows in weight table:", len(out))
+    print("Eligible hitters (>= pitches seen):", eligible.nunique())
+    print("Hitters in table:", out["batter"].nunique())
+    print("Rows in table:", len(out))
     print("Zones per hitter (min/median/max):",
           int(zones_per_hitter.min()),
           float(zones_per_hitter.median()),
           int(zones_per_hitter.max()))
-    print("Missing names (should be small):", int(out["player_name"].isna().sum()))
+    print("Missing names:", int(out["player_name"].isna().sum()))
     print(out.head(10))
 
     out.to_csv(out_path, index=False)

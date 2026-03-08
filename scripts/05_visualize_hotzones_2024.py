@@ -20,7 +20,11 @@ CLI (matches app.py):
 from __future__ import annotations
 
 import argparse
+import json
+from datetime import date, datetime
+from io import BytesIO
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -28,13 +32,14 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 from matplotlib.patches import Rectangle, Polygon
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from PIL import Image
 
 from config import PROCESSED_DIR, VIZ_DIR
 from utils_paths import heatmap_path
 
 NX = 5
 NZ = 5
-ALL_ZONES = list(range(NX * NZ))  # 0..24
+ALL_ZONES = list(range(NX * NZ))
 
 VALID_METRICS = {
     "zone_weight",
@@ -160,15 +165,12 @@ def fill_missing_zones_for_player(
     filled = base.merge(p[keep], on="zone_id", how="left")
 
     filled["pitches_seen"] = filled["pitches_seen"].fillna(0).astype(int)
-
     filled["bip_count"] = filled["bip_count"].fillna(0).astype(int)
     filled["xwoba_contact"] = filled["xwoba_contact"].fillna(filled["league_xwoba_contact"])
     filled["xwoba_shrunk"] = filled["xwoba_shrunk"].fillna(filled["league_xwoba_contact"])
     filled["zone_weight"] = filled["zone_weight"].fillna(0.0)
-
     filled["bip"] = filled["bip"].fillna(0).astype(int)
     filled["babip"] = filled["babip"].fillna(filled["league_babip"])
-
     filled["swings"] = filled["swings"].fillna(0).astype(int)
     filled["contact_rate"] = filled["contact_rate"].fillna(filled["league_contact_rate"])
 
@@ -212,12 +214,7 @@ def choose_cmap_norm_label(
             limit = max(abs(vmin), abs(vmax))
             if not np.isfinite(limit) or limit == 0:
                 limit = 0.01
-        return (
-            "bwr",
-            TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit),
-            0.0,
-            None,
-        )
+        return "bwr", TwoSlopeNorm(vmin=-limit, vcenter=0.0, vmax=limit), None
 
     if metric in ("xwoba_shrunk", "xwoba_contact"):
         vmin = float(np.nanmin(value_mat))
@@ -225,12 +222,13 @@ def choose_cmap_norm_label(
         spread = max(abs(vmax - league_avg_xwoba), abs(league_avg_xwoba - vmin))
         if not np.isfinite(spread) or spread == 0:
             spread = 0.01
-        vmin = league_avg_xwoba - spread
-        vmax = league_avg_xwoba + spread
         return (
             "bwr",
-            TwoSlopeNorm(vmin=vmin, vcenter=league_avg_xwoba, vmax=vmax),
-            league_avg_xwoba,
+            TwoSlopeNorm(
+                vmin=league_avg_xwoba - spread,
+                vcenter=league_avg_xwoba,
+                vmax=league_avg_xwoba + spread,
+            ),
             f"League Avg: {league_avg_xwoba:.3f}",
         )
 
@@ -240,12 +238,13 @@ def choose_cmap_norm_label(
         spread = max(abs(vmax - league_avg_babip), abs(league_avg_babip - vmin))
         if not np.isfinite(spread) or spread == 0:
             spread = 0.02
-        vmin = league_avg_babip - spread
-        vmax = league_avg_babip + spread
         return (
             "bwr",
-            TwoSlopeNorm(vmin=vmin, vcenter=league_avg_babip, vmax=vmax),
-            league_avg_babip,
+            TwoSlopeNorm(
+                vmin=league_avg_babip - spread,
+                vcenter=league_avg_babip,
+                vmax=league_avg_babip + spread,
+            ),
             f"League Avg: {league_avg_babip:.3f}",
         )
 
@@ -255,12 +254,13 @@ def choose_cmap_norm_label(
         spread = max(abs(vmax - league_avg_contact), abs(league_avg_contact - vmin))
         if not np.isfinite(spread) or spread == 0:
             spread = 0.02
-        vmin = league_avg_contact - spread
-        vmax = league_avg_contact + spread
         return (
             "bwr",
-            TwoSlopeNorm(vmin=vmin, vcenter=league_avg_contact, vmax=vmax),
-            league_avg_contact,
+            TwoSlopeNorm(
+                vmin=league_avg_contact - spread,
+                vcenter=league_avg_contact,
+                vmax=league_avg_contact + spread,
+            ),
             f"League Avg: {league_avg_contact:.3f}",
         )
 
@@ -268,9 +268,9 @@ def choose_cmap_norm_label(
         vmax = float(np.nanmax(value_mat))
         if not np.isfinite(vmax) or vmax <= 0:
             vmax = 1.0
-        return "Blues", plt.Normalize(vmin=0.0, vmax=vmax), None, None
+        return "Blues", plt.Normalize(vmin=0.0, vmax=vmax), None
 
-    return "viridis", None, None, None
+    return "viridis", None, None
 
 
 def get_count_matrix_for_metric(player_df: pd.DataFrame, metric: str) -> np.ndarray:
@@ -283,7 +283,7 @@ def get_count_matrix_for_metric(player_df: pd.DataFrame, metric: str) -> np.ndar
     return np.full((NZ, NX), np.nan, dtype=float)
 
 
-def load_batter_handedness(batter_id: int) -> str | None:
+def load_batter_handedness_from_zones(batter_id: int) -> str | None:
     zoned_path = PROCESSED_DIR / "statcast_zones_2024.csv"
     if not zoned_path.exists():
         return None
@@ -291,9 +291,6 @@ def load_batter_handedness(batter_id: int) -> str | None:
     try:
         z = pd.read_csv(zoned_path, usecols=["batter", "stand"])
     except Exception:
-        return None
-
-    if "batter" not in z.columns or "stand" not in z.columns:
         return None
 
     z = z.dropna(subset=["batter"]).copy()
@@ -306,7 +303,6 @@ def load_batter_handedness(batter_id: int) -> str | None:
         .str.upper()
         .str.strip()
     )
-
     if batter_rows.empty:
         return None
 
@@ -315,9 +311,73 @@ def load_batter_handedness(batter_id: int) -> str | None:
         return None
 
     hand = mode_vals.iloc[0]
-    if hand in {"L", "R"}:
-        return hand
-    return None
+    return hand if hand in {"L", "R"} else None
+
+
+def mlb_headshot_url(batter_id: int) -> str:
+    return (
+        "https://img.mlbstatic.com/mlb-photos/image/upload/"
+        f"d_people:generic:headshot:67:current.png/w_213,q_auto:best/v1/people/{int(batter_id)}/headshot/67/current"
+    )
+
+
+def fetch_json(url: str) -> dict | None:
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def fetch_image_array(url: str) -> np.ndarray | None:
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=8) as resp:
+            data = resp.read()
+        img = Image.open(BytesIO(data)).convert("RGB")
+        return np.array(img)
+    except Exception:
+        return None
+
+
+def compute_age_from_birthdate(birth_date: str | None) -> int | None:
+    if not birth_date:
+        return None
+    try:
+        born = datetime.strptime(birth_date, "%Y-%m-%d").date()
+        today = date.today()
+        return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+    except Exception:
+        return None
+
+
+def fetch_player_card_info(batter_id: int) -> dict:
+    out = {
+        "age": None,
+        "bat_side": None,
+        "throws": None,
+        "headshot": None,
+    }
+
+    api_url = f"https://statsapi.mlb.com/api/v1/people/{int(batter_id)}"
+    data = fetch_json(api_url)
+
+    if data and isinstance(data, dict):
+        people = data.get("people", [])
+        if people:
+            p = people[0]
+            out["age"] = compute_age_from_birthdate(p.get("birthDate"))
+            bat_side = ((p.get("batSide") or {}).get("code") or "").strip().upper()
+            throws = ((p.get("pitchHand") or {}).get("code") or "").strip().upper()
+            out["bat_side"] = bat_side if bat_side in {"L", "R", "S"} else None
+            out["throws"] = throws if throws in {"L", "R"} else None
+
+    if out["bat_side"] is None:
+        out["bat_side"] = load_batter_handedness_from_zones(batter_id)
+
+    out["headshot"] = fetch_image_array(mlb_headshot_url(batter_id))
+    return out
 
 
 def handedness_text_and_side(hand: str | None) -> tuple[str, str]:
@@ -325,7 +385,19 @@ def handedness_text_and_side(hand: str | None) -> tuple[str, str]:
         return "Left-Handed Batter", "right"
     if hand == "R":
         return "Right-Handed Batter", "left"
+    if hand == "S":
+        return "Switch Hitter", "left"
     return "Unknown Handedness", "left"
+
+
+def batting_hand_text(hand: str | None) -> str:
+    if hand == "L":
+        return "L"
+    if hand == "R":
+        return "R"
+    if hand == "S":
+        return "S"
+    return "Unknown"
 
 
 def add_handedness_text(ax: plt.Axes, hand: str | None) -> str:
@@ -352,7 +424,6 @@ def add_handedness_text(ax: plt.Axes, hand: str | None) -> str:
 
 def add_colorbar_opposite_side(fig: plt.Figure, ax: plt.Axes, im, batter_side: str):
     cbar_side = "right" if batter_side == "left" else "left"
-
     divider = make_axes_locatable(ax)
     cax = divider.append_axes(cbar_side, size="4.5%", pad=0.30)
     cbar = fig.colorbar(im, cax=cax)
@@ -364,15 +435,12 @@ def add_colorbar_opposite_side(fig: plt.Figure, ax: plt.Axes, im, batter_side: s
         cax.yaxis.set_ticks_position("right")
         cax.yaxis.set_label_position("right")
 
-    # remove all colorbar label text
     cbar.set_label("")
     return cbar
 
 
 def add_league_average_note(ax: plt.Axes, metric: str, league_note: str | None) -> None:
-    if metric == "zone_weight":
-        return
-    if league_note is None:
+    if metric == "zone_weight" or league_note is None:
         return
 
     ax.text(
@@ -388,6 +456,62 @@ def add_league_average_note(ax: plt.Axes, metric: str, league_note: str | None) 
     )
 
 
+def add_player_banner(
+    fig: plt.Figure,
+    raw_player_name: str,
+    batter_id: int,
+    metric: str,
+    player_card: dict,
+) -> None:
+    name_text = display_player_name(raw_player_name, batter_id)
+    stat_text = display_metric_name(metric)
+
+    age = player_card.get("age")
+    bat_side = player_card.get("bat_side")
+    throws = player_card.get("throws")
+
+    age_text = f"Age: {age}" if age is not None else "Age: Unknown"
+    bats_throws_text = f"Bats/Throws: {batting_hand_text(bat_side)}/{throws if throws else 'Unknown'}"
+
+    # banner background
+    ax_banner = fig.add_axes([0.04, 0.79, 0.92, 0.15])
+    ax_banner.set_facecolor("#e7e7e7")
+    ax_banner.set_xticks([])
+    ax_banner.set_yticks([])
+    for spine in ax_banner.spines.values():
+        spine.set_visible(False)
+
+    # headshot area
+    ax_img = fig.add_axes([0.055, 0.802, 0.12, 0.125])
+    ax_img.set_xticks([])
+    ax_img.set_yticks([])
+    for spine in ax_img.spines.values():
+        spine.set_visible(False)
+
+    headshot = player_card.get("headshot")
+    if headshot is not None:
+        ax_img.imshow(headshot)
+        ax_img.set_aspect("auto")
+    else:
+        ax_img.set_facecolor("#d0d0d0")
+        ax_img.text(
+            0.5,
+            0.5,
+            "No Image",
+            ha="center",
+            va="center",
+            fontsize=10,
+            fontweight="bold",
+            transform=ax_img.transAxes,
+        )
+
+    # text block
+    fig.text(0.20, 0.875, name_text, ha="left", va="center", fontsize=20, fontweight="bold")
+    fig.text(0.20, 0.835, stat_text, ha="left", va="center", fontsize=13, fontweight="bold")
+    fig.text(0.73, 0.878, age_text, ha="right", va="center", fontsize=11.5)
+    fig.text(0.93, 0.878, bats_throws_text, ha="right", va="center", fontsize=11.5)
+
+
 def plot_heatmap(
     player_df: pd.DataFrame,
     metric: str,
@@ -398,8 +522,6 @@ def plot_heatmap(
 ) -> Path:
     raw_player_name = str(player_df["player_name"].iloc[0] or "")
     batter_id = int(player_df["batter"].iloc[0])
-    title_name = display_player_name(raw_player_name, batter_id)
-    metric_display = display_metric_name(metric)
 
     value_mat = zones_to_matrix(player_df.set_index("zone_id")[metric])
 
@@ -407,7 +529,7 @@ def plot_heatmap(
     league_avg_babip = float(player_df["league_babip"].drop_duplicates().mean())
     league_avg_contact = float(player_df["league_contact_rate"].drop_duplicates().mean())
 
-    cmap, norm, _, league_note = choose_cmap_norm_label(
+    cmap, norm, league_note = choose_cmap_norm_label(
         metric,
         value_mat,
         league_avg_xwoba,
@@ -416,13 +538,15 @@ def plot_heatmap(
         fixed_limit,
     )
 
-    batter_hand = load_batter_handedness(batter_id)
+    player_card = fetch_player_card_info(batter_id)
+    batter_hand = player_card.get("bat_side")
 
-    fig, ax = plt.subplots(figsize=(7.6, 6.9))
+    fig = plt.figure(figsize=(8.0, 9.1))
+    ax = fig.add_axes([0.11, 0.12, 0.68, 0.58])
+
     im = ax.imshow(value_mat, cmap=cmap, norm=norm, aspect="equal", interpolation="nearest", zorder=1)
 
-    ax.set_title(f"{title_name} — {season} {metric_display}", fontsize=14, pad=12)
-
+    ax.set_title("")
     ax.set_xlabel("")
     ax.set_ylabel("")
     ax.set_xticks([])
@@ -442,6 +566,7 @@ def plot_heatmap(
 
     add_colorbar_opposite_side(fig, ax, im, batter_side)
     add_league_average_note(ax, metric, league_note)
+    add_player_banner(fig, raw_player_name, batter_id, metric, player_card)
 
     count_mat = get_count_matrix_for_metric(player_df, metric)
 
@@ -482,7 +607,6 @@ def plot_heatmap(
     VIZ_DIR.mkdir(parents=True, exist_ok=True)
     out_path = heatmap_path(VIZ_DIR, season, metric, raw_player_name, batter_id)
 
-    fig.tight_layout()
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return out_path

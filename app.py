@@ -1,4 +1,4 @@
-# app.py — sidebar controls + auto-updating heatmap
+# app.py — sidebar controls + live narrowing player search + auto-updating heatmap
 #
 # Run:
 #   streamlit run app.py
@@ -70,17 +70,14 @@ def load_players(weights_path: Path) -> pd.DataFrame:
 
     df = df.dropna(subset=["batter"]).copy()
     df["batter"] = df["batter"].astype(int)
-
-    if "player_name" not in df.columns:
-        df["player_name"] = ""
-
     df["player_name"] = df["player_name"].fillna("").astype(str)
 
-    return (
+    out = (
         df.drop_duplicates(subset=["player_name", "batter"])
         .sort_values("player_name")
         .reset_index(drop=True)
     )
+    return out
 
 
 def run_script5(
@@ -148,29 +145,59 @@ if players.empty:
     st.stop()
 
 # -----------------------------------------------------
+# Session state
+# -----------------------------------------------------
+if "selected_batter_id" not in st.session_state:
+    st.session_state.selected_batter_id = int(players.iloc[0]["batter"])
+
+if "last_request_key" not in st.session_state:
+    st.session_state.last_request_key = None
+
+if "last_gen_result" not in st.session_state:
+    st.session_state.last_gen_result = None
+
+# -----------------------------------------------------
 # Sidebar UI
 # -----------------------------------------------------
 with st.sidebar:
     st.header("Controls")
 
-    name_query = st.text_input("Search Player", "")
-    q = name_query.strip().lower()
+    search_text = st.text_input(
+        "Search Player",
+        value="",
+        placeholder="Start typing a player name...",
+    ).strip()
 
-    if q:
-        matches = players[players["player_name"].str.lower().str.contains(q, na=False)].head(100)
+    if search_text:
+        matches = players[
+            players["player_name"].str.lower().str.contains(search_text.lower(), na=False)
+        ].copy()
     else:
-        matches = players.head(100)
+        matches = players.copy()
 
     if matches.empty:
         st.warning("No players found.")
         st.stop()
 
-    options = list(matches.itertuples(index=False, name=None))
+    # keep prior selected player if still in filtered list
+    match_ids = matches["batter"].astype(int).tolist()
+    if st.session_state.selected_batter_id not in match_ids:
+        st.session_state.selected_batter_id = int(matches.iloc[0]["batter"])
 
-    def format_player(opt) -> str:
-        return f"{format_player_name(opt[0], int(opt[1]))} ({int(opt[1])})"
+    # show the live narrowing list directly under the search bar
+    player_options = matches["batter"].astype(int).tolist()
 
-    choice = st.selectbox("Player", options=options, format_func=format_player)
+    def batter_to_label(bid: int) -> str:
+        row = matches.loc[matches["batter"].astype(int) == int(bid)].iloc[0]
+        return f"{format_player_name(row['player_name'], int(row['batter']))} ({int(row['batter'])})"
+
+    selected_batter = st.selectbox(
+        "Player",
+        options=player_options,
+        index=player_options.index(st.session_state.selected_batter_id),
+        format_func=batter_to_label,
+    )
+    st.session_state.selected_batter_id = int(selected_batter)
 
     metric_display_options = [METRIC_DISPLAY[m] for m in METRICS]
     selected_metric_display = st.selectbox("Metric", metric_display_options, index=0)
@@ -179,8 +206,14 @@ with st.sidebar:
     annotate_values = st.checkbox("Annotate Values", value=True)
     annotate_counts = st.checkbox("Annotate Sample Size (n)", value=True)
 
-player_name = str(choice[0] or "")
-batter_id = int(choice[1])
+    st.caption(f"{len(matches)} player(s) shown")
+
+# -----------------------------------------------------
+# Selected player
+# -----------------------------------------------------
+selected_row = players.loc[players["batter"].astype(int) == int(st.session_state.selected_batter_id)].iloc[0]
+player_name = str(selected_row["player_name"] or "")
+batter_id = int(selected_row["batter"])
 
 # -----------------------------------------------------
 # Image path
@@ -197,12 +230,6 @@ image_path = heatmap_path(
 # Automatic regeneration
 # -----------------------------------------------------
 request_key = (batter_id, metric, annotate_values, annotate_counts)
-
-if "last_request_key" not in st.session_state:
-    st.session_state.last_request_key = None
-
-if "last_gen_result" not in st.session_state:
-    st.session_state.last_gen_result = None
 
 if request_key != st.session_state.last_request_key:
     st.session_state.last_request_key = request_key
